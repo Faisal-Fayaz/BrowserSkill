@@ -462,7 +462,7 @@ pub fn info_for_error(code: ErrorCode, data: Option<&serde_json::Value>) -> Rend
         (ErrorCode::Timeout, reason::SESSION_BUSY) => RenderInfo {
             summary: "previous session command is still running",
             hint: Some(
-                "wait for the current command to finish, or cancel it with Ctrl-C in the terminal running that command, then retry",
+                "wait for the current command to finish, or cancel it through its parent process or with Ctrl-C in the terminal running that command, then retry; if the caller is gone and the session stays busy, use `bsk daemon restart` (interrupts all sessions)",
             ),
             exit_code: base.exit_code,
         },
@@ -745,7 +745,10 @@ mod tests {
         let hint = info.hint.unwrap();
         assert!(hint.contains("wait for the current command"));
         assert!(hint.contains("Ctrl-C in the terminal running that command"));
+        assert!(hint.contains("parent process"));
         assert!(hint.contains("then retry"));
+        assert!(hint.contains("bsk daemon restart"));
+        assert!(hint.contains("interrupts all sessions"));
         assert!(!hint.contains("stop/restart"));
         assert_eq!(info.exit_code, 4);
     }
