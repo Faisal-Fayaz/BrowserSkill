@@ -34,9 +34,10 @@ use crate::ipc_client::IpcClient;
 /// SIGINT triggers. Picked per design §4.6 ("≤ 2s, then force exit").
 pub const CANCEL_RESPONSE_GRACE: Duration = Duration::from_secs(2);
 
-/// Hard cap on the cancel-frame's own IPC round-trip. Independent of
-/// the original call's timeout because cancel must answer promptly.
+/// Hard cap on confirming cancellation, including retries before registration.
+/// Independent of the original call's timeout because cancel must answer promptly.
 const CANCEL_FRAME_TIMEOUT: Duration = Duration::from_secs(2);
+const CANCEL_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Issue a business RPC against the daemon with SIGINT-driven
 /// cancellation.
@@ -99,7 +100,14 @@ where
         sig = wait_for_cancel(parent_cancel) => {
             sig.context("wait for cancellation").map_err(CliError::Local)?;
             debug!(rpc_id = %rpc_id_for_cancel, "forwarding cancel to daemon");
-            let _ = send_cancel(&sock, &rpc_id_for_cancel).await;
+            // Separate IPC connections can deliver cancel before the business
+            // request is registered. Keep polling that request while confirming
+            // cancellation, including any write that has not completed yet.
+            tokio::select! {
+                biased;
+                res = &mut main_fut => return res?.map_err(CliError::from_rpc),
+                _ = send_cancel(&sock, &rpc_id_for_cancel) => {},
+            }
             match tokio::time::timeout(CANCEL_RESPONSE_GRACE, &mut main_fut).await {
                 Ok(res) => res?,
                 Err(_) => {
@@ -162,6 +170,8 @@ pub fn release_transfers<'a>(
 
 /// Send a `cancel { rpc_id }` frame over a fresh connection so it
 /// lands on the daemon while the original call is still parked.
+/// An unmatched request may still be in transit on the other connection;
+/// retry until it is registered, within the same bounded confirmation budget.
 ///
 /// The on-the-wire method name is `cancel` (not `system.cancel`)
 /// because that is the identifier registered in
@@ -172,18 +182,27 @@ pub fn release_transfers<'a>(
 /// stays loud.
 pub async fn send_cancel(sock: &Path, rpc_id: &str) -> anyhow::Result<()> {
     let mut client = IpcClient::connect(sock).await?;
-    let cancel_id = format!("cancel-{}", random_short_id());
-    let _ignored: anyhow::Result<std::result::Result<CancelResult, RpcError>> = client
-        .call_with_id::<_, CancelResult>(
-            cancel_id,
-            Method::Cancel,
-            Some(CancelParams {
-                rpc_id: rpc_id.to_string(),
-            }),
-            CANCEL_FRAME_TIMEOUT,
-        )
-        .await;
-    Ok(())
+    tokio::time::timeout(CANCEL_FRAME_TIMEOUT, async {
+        loop {
+            let result = client
+                .call_with_id::<_, CancelResult>(
+                    format!("cancel-{}", random_short_id()),
+                    Method::Cancel,
+                    Some(CancelParams {
+                        rpc_id: rpc_id.to_string(),
+                    }),
+                    CANCEL_FRAME_TIMEOUT,
+                )
+                .await?
+                .map_err(CliError::from_rpc)?;
+            if result.cancelled {
+                return Ok(());
+            }
+            tokio::time::sleep(CANCEL_RETRY_INTERVAL).await;
+        }
+    })
+    .await
+    .context("daemon did not confirm cancellation within the time budget")?
 }
 
 fn random_short_id() -> String {

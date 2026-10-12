@@ -50,6 +50,9 @@ fn stdin_close_cancels_business_but_releases_resources_with_a_bounded_budget() {
 async fn exercise(transfers: Arc<TransferRegistry>, staging_root: &Path) {
     for mode in [
         "wait",
+        "late-registration",
+        "missing-registration",
+        "completed-during-cancel",
         "upload",
         "upload-multi",
         "upload-before-dispatch",
@@ -89,6 +92,7 @@ async fn exercise(transfers: Arc<TransferRegistry>, staging_root: &Path) {
             None
         };
         let (cancel, cancelled) = watch::channel(false);
+        let first_cancel = Arc::new(Notify::new());
         let ready = Arc::clone(&registered);
         let name = pipe_name.clone();
         let registry = Arc::clone(&transfers);
@@ -104,6 +108,7 @@ async fn exercise(transfers: Arc<TransferRegistry>, staging_root: &Path) {
                 let ready = Arc::clone(&ready);
                 let pending = Arc::clone(&pending);
                 let cancel = cancel.clone();
+                let first_cancel = Arc::clone(&first_cancel);
                 let mut cancelled = cancelled.clone();
                 let name = name.clone();
                 let registry = Arc::clone(&registry);
@@ -144,6 +149,11 @@ async fn exercise(transfers: Arc<TransferRegistry>, staging_root: &Path) {
                             Method::ToolWaitMs if mode == "ordinary" => {
                                 ResponseBody::Ok(json!({"waited_ms": 1}))
                             }
+                            Method::ToolWaitMs if mode == "completed-during-cancel" => {
+                                ready.notify_one();
+                                first_cancel.notified().await;
+                                ResponseBody::Ok(json!({"waited_ms": 1}))
+                            }
                             Method::TransferChunk
                                 if mode == "upload-before-dispatch"
                                     || (mode.contains("multi")
@@ -160,6 +170,15 @@ async fn exercise(transfers: Arc<TransferRegistry>, staging_root: &Path) {
                             | Method::TransferChunk
                             | Method::TransferRead
                             | Method::TransferFinish => {
+                                if mode == "late-registration" || mode == "missing-registration" {
+                                    // Independent IPC connections need not reach registration in
+                                    // send order. Let the first cancel overtake this request.
+                                    ready.notify_one();
+                                    first_cancel.notified().await;
+                                    if mode == "missing-registration" {
+                                        std::future::pending::<()>().await;
+                                    }
+                                }
                                 *pending.lock().unwrap() = Some(req.id.clone());
                                 ready.notify_one();
                                 cancelled.wait_for(|value| *value).await.unwrap();
@@ -180,9 +199,17 @@ async fn exercise(transfers: Arc<TransferRegistry>, staging_root: &Path) {
                             }
                             Method::Cancel => {
                                 let target = params["rpc_id"].as_str().unwrap();
-                                assert_eq!(pending.lock().unwrap().as_deref(), Some(target));
-                                cancel.send(true).unwrap();
-                                ResponseBody::Ok(json!({"cancelled": true}))
+                                let matched = pending.lock().unwrap().as_deref() == Some(target);
+                                if matched {
+                                    cancel.send(true).unwrap();
+                                } else {
+                                    assert!(
+                                        mode.ends_with("registration")
+                                            || mode == "completed-during-cancel"
+                                    );
+                                    first_cancel.notify_one();
+                                }
+                                ResponseBody::Ok(json!({"cancelled": matched}))
                             }
                             Method::TransferRelease => {
                                 let params: TransferIdParams =
@@ -278,15 +305,28 @@ async fn exercise(transfers: Arc<TransferRegistry>, staging_root: &Path) {
         let _ = server.await;
         assert_eq!(
             output.status.code(),
-            Some(if mode == "ordinary" { 0 } else { 2 }),
+            Some(if mode == "ordinary" || mode == "completed-during-cancel" {
+                0
+            } else {
+                2
+            }),
             "{mode}: stdout={} stderr={}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        if mode != "ordinary" {
+        if mode == "completed-during-cancel" {
+            let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(body["waited_ms"], 1);
+        } else if mode != "ordinary" {
             let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(body["code"], "cancelled");
-            if mode != "upload-before-dispatch" {
+            if mode == "missing-registration" {
+                assert_eq!(
+                    body["message"],
+                    "rpc did not respond within cancel grace window"
+                );
+                assert!(start.elapsed() < Duration::from_secs(6));
+            } else if mode != "upload-before-dispatch" {
                 assert_eq!(body["message"], "parent cancellation reached daemon");
             }
             let received = received.lock().unwrap();
@@ -294,9 +334,12 @@ async fn exercise(transfers: Arc<TransferRegistry>, staging_root: &Path) {
             assert!(
                 received[cancel + 1..]
                     .iter()
-                    .all(|m| *m == Method::TransferRelease),
+                    .all(|m| *m == Method::TransferRelease || *m == Method::Cancel),
                 "only cleanup may follow cancellation: {received:?}"
             );
+            if mode.ends_with("registration") {
+                assert!(received.iter().filter(|m| **m == Method::Cancel).count() > 1);
+            }
         }
         let ids = ids.lock().unwrap();
         if mode.contains("stall") {
